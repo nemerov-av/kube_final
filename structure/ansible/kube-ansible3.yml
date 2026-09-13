@@ -1,0 +1,21 @@
+- hosts: [control_plane, workers, lb]
+  become: yes
+
+  tasks:
+    - name: Настройка параметров безопасности в sshd_config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^#?HostKeyAlgorithms', line: 'HostKeyAlgorithms +ssh-rsa' }
+        - { regexp: '^#?PubkeyAcceptedKeyTypes', line: 'PubkeyAcceptedKeyTypes +ssh-rsa' }
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+      notify: restart ssh
+
+  handlers:
+    - name: restart ssh
+      service:
+        name: ssh
+        state: restarted

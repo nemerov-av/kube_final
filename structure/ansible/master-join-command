@@ -1,0 +1,1 @@
+kubeadm join 158.160.241.54:6443 --token qkozki.mbzo15to78ik07j8 --discovery-token-ca-cert-hash sha256:91e2103e92a020bf1db77fd1a9dcfcb1b301c51ca52492decc7b306769535873  --control-plane --certificate-key ec55e586524cfb2a0ee3d3f56ca8663470cf95514b9ed5b45401c0b781e8c86f

@@ -1,0 +1,49 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  # Замените crp... на реальный ID вашего реестра Yandex Container Registry
+  REGISTRY: "cr.yandex/"
+  IMAGE_NAME: "loadgenerator"
+
+
+build_image:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  tags:
+    - ext
+  script:
+    # 1. Создаем директорию для конфигурации
+    - mkdir -p /kaniko/.docker
+    
+    # 2. Кодируем правильный JSON-ключ из переменной-файла в base64 без переносов строк
+    - AUTH_BASE64=$(echo -n "json_key:$(cat $YC_KEY)" | base64 | tr -d '\n')
+    
+    # 3. Записываем конфигурацию авторизации
+    - echo "{\"auths\":{\"https://cr.yandex\":{\"auth\":\"$AUTH_BASE64\"}}}" > /kaniko/.docker/config.json
+    
+    # 4. Запускаем сборку
+    - /kaniko/executor --context $CI_PROJECT_DIR/step2 --dockerfile $CI_PROJECT_DIR/step2/Dockerfile --destination $REGISTRY/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA
+  only:
+    - master
+
+
+
+deploy_to_k8s:
+  stage: deploy
+  image: dtzar/helm-kubectl:latest
+  tags:
+    - ext
+  script:
+    - echo "Деплой в Kubernetes кластер..."
+    # Подключаем Kubeconfig из защищенных переменных GitLab
+    - export KUBECONFIG=$KUBECONFIG_DATA
+    # Проверяем доступность нашего кластера
+    - kubectl get nodes
+    # Деплоим/обновляем наш релиз в кластере через написанный Helm-чарт
+    - helm upgrade --install loadgenerator ./step2/loadgenerator --namespace default --set image.repository="${REGISTRY}/${IMAGE_NAME}" --set image.tag="${CI_COMMIT_SHORT_SHA}"
+  only:
+    - master

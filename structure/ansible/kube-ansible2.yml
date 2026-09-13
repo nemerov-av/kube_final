@@ -1,0 +1,321 @@
+---
+# ОПРОС: Сначала принудительно собираем базовые данные со всех мастеров
+- name: Pre-gather facts from master nodes
+  hosts: control_plane
+  gather_facts: true
+
+# ШАГ 1: Теперь настраиваем балансировщик, зная, что все данные мастеров уже есть в памяти Ansible
+- name: Install and configure HAProxy on LB
+  hosts: lb
+  become: true
+  gather_facts: true
+  vars:
+    my_file: /etc/haproxy/haproxy.cfg
+    my_template: templates/haproxy.j2
+  tasks:
+    - name: install haproxy
+      apt:
+        name: haproxy
+        state: present
+        update_cache: true
+
+    - name: Stop haproxy service before configuring
+      service:
+        name: haproxy
+        state: stopped
+
+    - name: Create haproxy.cfg from template
+      ansible.builtin.template:
+        src: "{{ my_template }}"
+        dest: "{{ my_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: start haproxy service
+      service:
+        name: haproxy
+        state: started
+
+# ШАГ 2: Базовая подготовка всех будущих нод Kubernetes (Контейнеры, Своп, Репозитории)
+- hosts: control_plane,workers
+  become: yes
+  gather_facts: true
+  vars:
+    k8s_repo_version: "v1.34"
+    k8s_pkg_version: "1.34*"
+
+  tasks:
+    - name: Create containerd config file
+      file:
+        path: "/etc/modules-load.d/containerd.conf"
+        state: "touch"
+
+    - name: Add conf for containerd
+      blockinfile:
+        path: "/etc/modules-load.d/containerd.conf"
+        block: |
+          overlay
+          br_netfilter
+
+    - name: modprobe
+      shell: |
+        modprobe overlay
+        modprobe br_netfilter
+
+    - name: Set system configurations for Kubernetes networking
+      file:
+        path: "/etc/sysctl.d/99-kubernetes-cri.conf"
+        state: "touch"
+
+    - name: Add conf for containerd
+      blockinfile:
+        path: "/etc/sysctl.d/99-kubernetes-cri.conf"
+        block: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+
+    - name: Apply new settings
+      command: sysctl --system
+
+    - name: install containerd
+      shell: |
+        apt-get update && apt-get install -y containerd
+        mkdir -p /etc/containerd
+        containerd config default | tee /etc/containerd/config.toml
+        systemctl restart containerd
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Remove swapfile from /etc/fstab
+      mount:
+        name: swap
+        fstype: swap
+        state: absent
+
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: install python3-debian
+      apt: name=python3-debian state=present
+
+    - name: apt update and install pre-requisites
+      apt:
+        name: [apt-transport-https, ca-certificates, curl, gpg]
+        state: present
+        update_cache: yes
+
+    - name: Принудительное удаление старых проблемных репозиториев (очистка)
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/kubernetes.list
+        - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Создание директории для ключей
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Скачивание и правильный dearmor GPG ключа
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_repo_version }}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Добавление Kubernetes APT repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_repo_version }}/deb/ /"
+        filename: kubernetes
+        state: present
+        update_cache: yes
+
+    - name: install kubelet
+      apt:
+        name: kubelet={{ k8s_pkg_version }}
+        state: present
+        force: yes
+
+    - name: install kubeadm
+      apt:
+        name: kubeadm={{ k8s_pkg_version }}
+        state: present
+        force: yes
+
+    - name: Restart service kubelet
+      ansible.builtin.systemd_service:
+        state: restarted
+        daemon_reload: true
+        name: kubelet
+
+
+      
+
+
+# ШАГ 3: Установка kubectl и Helm на все мастер-ноды (control_plane)
+- hosts: control_plane
+  become: yes
+  vars:
+    k8s_pkg_version: "1.34*"
+  tasks:
+    - name: install kubectl
+      apt:
+        name: kubectl={{ k8s_pkg_version }}
+        state: present
+        force: yes
+
+    - name: install helm
+      shell: |
+        curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        chmod 700 get_helm.sh
+        ./get_helm.sh
+      args:
+        creates: /usr/local/bin/helm
+
+# ШАГ 4: Инициализация первого мастера (control1)
+- hosts: control1
+  become: yes
+  gather_facts: true
+  tasks:
+    - name: Initialize the Kubernetes cluster using kubeadm
+      command: >
+        kubeadm init
+        --control-plane-endpoint {{ hostvars[groups['lb'][0]]['ansible_host'] }}:6443
+        --upload-certs
+        --pod-network-cidr 10.244.0.0/16
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Создать директорию .kube для пользователя ubuntu
+      ansible.builtin.file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0700'
+
+    - name: Скопировать admin.conf в профиль пользователя ubuntu
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        remote_src: yes
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    - name: Install calico pod network
+      become_user: ubuntu
+      shell: |
+        curl https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/calico.yaml -O
+        sed -i 's/192.168.0.0\/16/10.244.0.0\/16/g' calico.yaml
+        kubectl apply -f calico.yaml
+      args:
+        creates: /home/ubuntu/calico.yaml
+
+    - name: Generate master join command
+      shell: echo "$(kubeadm token create --print-join-command) --control-plane --certificate-key $(kubeadm init phase upload-certs --upload-certs | grep -v upload-certs)"
+      register: master_join_command
+
+    - name: Generate worker join command
+      command: kubeadm token create --print-join-command
+      register: worker_join_command
+
+# ШАГ 5: Добавление control2 и control3 в кластер как новых мастеров
+- hosts: control_plane
+  become: yes
+  gather_facts: true
+  tasks:
+    - name: Join additional control plane nodes
+      command: "{{ hostvars['control1']['master_join_command']['stdout'] }}"
+      args:
+        creates: /etc/kubernetes/manifests/kube-apiserver.yaml
+      when: inventory_hostname != 'control1'
+
+    - name: Создать директорию .kube для вторичных мастеров
+      ansible.builtin.file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0700'
+      when: inventory_hostname != 'control1'
+
+    - name: Безопасное копирование конфигурации на вторичные мастера
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        remote_src: yes
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+      when: inventory_hostname != 'control1'
+
+# ШАГ 6: Добавление Воркеров (worker1) в кластер
+- hosts: workers
+  become: yes
+  gather_facts: true
+  tasks:
+    - name: Join the worker node to cluster
+      command: "{{ hostvars['control1']['worker_join_command']['stdout'] }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+
+
+# ШАГ 7: Автоматическая установка NGINX Ingress Controller через Helm на ВСЕ ноды
+- hosts: control1
+  become: yes
+  tasks:
+    - name: Add Ingress-NGINX Helm repository
+      kubernetes.core.helm_repository:
+        name: ingress-nginx
+        repo_url: "https://kubernetes.github.io/ingress-nginx"
+
+    - name: Install NGINX Ingress Controller via Helm
+      kubernetes.core.helm:
+        name: ingress-nginx
+        chart_ref: ingress-nginx/ingress-nginx
+        release_namespace: ingress-nginx
+        create_namespace: true
+        kubeconfig: /etc/kubernetes/admin.conf
+        values:
+          controller:
+            kind: DaemonSet
+            tolerations:
+              - key: "node-role.kubernetes.io/control-plane"
+                operator: "Exists"
+                effect: "NoSchedule"
+            service:
+              type: NodePort
+              nodePorts:
+                http: 30080
+                https: 30443
+          # Допуски для служебных подов валидации
+          controller.admissionWebhooks.patch.tolerations:
+            - key: "node-role.kubernetes.io/control-plane"
+              operator: "Exists"
+              effect: "NoSchedule"
+
+# ШАГ 8: Обновление конфигурации HAProxy на LB для работы с веб-трафиком
+- name: Update HAProxy configuration on LB for Ingress
+  hosts: lb
+  become: true
+  vars:
+    my_file: /etc/haproxy/haproxy.cfg
+    my_template: templates/haproxy.j2
+  tasks:
+    - name: Regenerate haproxy.cfg with Ingress ports
+      ansible.builtin.template:
+        src: "{{ my_template }}"
+        dest: "{{ my_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Restart HAProxy service to apply changes
+      service:
+        name: haproxy
+        state: restarted
